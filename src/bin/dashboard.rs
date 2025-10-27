@@ -50,6 +50,7 @@ struct TrayController {
     icon_id: TrayIconId,
     show_id: MenuId,
     exit_id: MenuId,
+    event_rx: std::sync::mpsc::Receiver<TrayAction>,
 }
 
 #[cfg(windows)]
@@ -61,11 +62,13 @@ impl TrayController {
         let show_item = MenuItemBuilder::new()
             .id(show_id.clone())
             .text("Open Dashboard")
+            .enabled(true)
             .build();
 
         let exit_item = MenuItemBuilder::new()
             .id(exit_id.clone())
             .text("Quit")
+            .enabled(true)
             .build();
 
         let separator = PredefinedMenuItem::separator();
@@ -84,11 +87,38 @@ impl TrayController {
             .build()
             .ok()?;
 
+        let (tx, rx) = std::sync::mpsc::channel();
+        let icon_id = icon.id().clone();
+        {
+            let tx = tx.clone();
+            let icon_id = icon_id.clone();
+            TrayIconEvent::set_event_handler(Some(move |event| {
+                if event.id == icon_id
+                    && matches!(event.click_type, ClickType::Left | ClickType::Double)
+                {
+                    let _ = tx.send(TrayAction::Show);
+                }
+            }));
+        }
+        {
+            let tx = tx.clone();
+            let show_id = show_id.clone();
+            let exit_id = exit_id.clone();
+            MenuEvent::set_event_handler(Some(move |event| {
+                if event.id == show_id {
+                    let _ = tx.send(TrayAction::Show);
+                } else if event.id == exit_id {
+                    let _ = tx.send(TrayAction::Exit);
+                }
+            }));
+        }
+
         Some(Self {
-            icon_id: icon.id().clone(),
+            icon_id,
             _icon: icon,
             show_id,
             exit_id,
+            event_rx: rx,
         })
     }
 
@@ -104,22 +134,8 @@ impl TrayController {
     where
         F: FnMut(TrayAction),
     {
-        let tray_events = TrayIconEvent::receiver();
-        while let Ok(event) = tray_events.try_recv() {
-            if event.id == self.icon_id
-                && matches!(event.click_type, ClickType::Left | ClickType::Double)
-            {
-                on_action(TrayAction::Show);
-            }
-        }
-
-        let menu_events = MenuEvent::receiver();
-        while let Ok(event) = menu_events.try_recv() {
-            if event.id == self.show_id {
-                on_action(TrayAction::Show);
-            } else if event.id == self.exit_id {
-                on_action(TrayAction::Exit);
-            }
+        while let Ok(action) = self.event_rx.try_recv() {
+            on_action(action);
         }
     }
 }
