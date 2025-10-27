@@ -1,0 +1,13 @@
+# Build artifacts
+/target/
+
+# Windows binaries and debug symbols
+*.exe
+*.pdb
+*.dll
+*.lib
+*.exp
+
+# VS Code / editor settings
+/.vscode/
+*.log
