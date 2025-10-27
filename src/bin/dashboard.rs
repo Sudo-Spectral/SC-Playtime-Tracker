@@ -1,11 +1,11 @@
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::{
     collections::HashSet,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -15,8 +15,8 @@ use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use eframe::egui::epaint::Shadow;
 use eframe::egui::{
-    self, Color32, Frame, Grid, Margin, RichText, Rounding, ScrollArea, Stroke, Vec2b,
-    style::Visuals,
+    self, style::Visuals, Color32, Frame, Grid, Margin, RichText, Rounding, ScrollArea, Stroke,
+    Vec2b, ViewportCommand,
 };
 use egui_plot::{Bar, BarChart, Legend, Plot, PlotBounds, PlotPoint};
 use rfd::FileDialog;
@@ -32,10 +32,92 @@ use star_citizen_playtime::storage::{
 #[cfg(windows)]
 use std::{env, process::Command};
 
+#[cfg(windows)]
+use tray_icon::{
+    icon::Icon,
+    menu::{MenuBuilder, MenuId, MenuItemBuilder, PredefinedMenuItem},
+    TrayEvent, TrayIcon, TrayIconBuilder, TrayIconEvent,
+};
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum DashboardTab {
     Overview,
     Insights,
+}
+
+#[cfg(windows)]
+struct TrayController {
+    icon: TrayIcon,
+    show_id: MenuId,
+    exit_id: MenuId,
+    event_rx: std::sync::mpsc::Receiver<TrayEvent>,
+}
+
+#[cfg(windows)]
+impl TrayController {
+    fn new() -> Option<Self> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            let _ = tx.send(event.clone());
+        }));
+
+        let show_id = MenuId::new("open_dashboard");
+        let exit_id = MenuId::new("quit_dashboard");
+
+        let menu = MenuBuilder::new()
+            .item(
+                &MenuItemBuilder::new()
+                    .id(show_id)
+                    .text("Open Dashboard")
+                    .build()
+                    .ok()?,
+            )
+            .separator(&PredefinedMenuItem::separator())
+            .item(
+                &MenuItemBuilder::new()
+                    .id(exit_id)
+                    .text("Quit")
+                    .build()
+                    .ok()?,
+            )
+            .build()
+            .ok()?;
+
+        let icon = Icon::from_rgba(Self::icon_pixels(), 16, 16).ok()?;
+
+        let icon = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_icon(icon)
+            .with_tooltip("Star Citizen Playtime")
+            .build()
+            .ok()?;
+
+        Some(Self {
+            icon,
+            show_id,
+            exit_id,
+            event_rx: rx,
+        })
+    }
+
+    fn icon_pixels() -> Vec<u8> {
+        let mut data = Vec::with_capacity(16 * 16 * 4);
+        for _ in 0..(16 * 16) {
+            data.extend_from_slice(&[0x42, 0x7A, 0xC4, 0xFF]);
+        }
+        data
+    }
+
+    fn poll(&self) -> Option<TrayEvent> {
+        self.event_rx.try_recv().ok()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TrayController {
+    fn drop(&mut self) {
+        TrayIconEvent::set_event_handler(None);
+    }
 }
 
 fn main() -> Result<()> {
@@ -112,6 +194,16 @@ struct PlaytimeApp {
     last_leaderboard_attempt: Option<Instant>,
     last_leaderboard_success: Option<Instant>,
     leaderboard_sync_interval: Duration,
+    #[cfg(windows)]
+    tray: Option<TrayController>,
+    #[cfg(windows)]
+    first_frame: bool,
+    #[cfg(windows)]
+    pending_hide: bool,
+    #[cfg(windows)]
+    pending_show: bool,
+    #[cfg(windows)]
+    pending_exit: bool,
 }
 
 #[derive(Default)]
@@ -167,6 +259,16 @@ impl PlaytimeApp {
             last_leaderboard_attempt: None,
             last_leaderboard_success: None,
             leaderboard_sync_interval: Duration::from_secs(300),
+            #[cfg(windows)]
+            tray: TrayController::new(),
+            #[cfg(windows)]
+            first_frame: true,
+            #[cfg(windows)]
+            pending_hide: true,
+            #[cfg(windows)]
+            pending_show: false,
+            #[cfg(windows)]
+            pending_exit: false,
         };
         app.refresh_sessions();
         app.start_monitor();
@@ -212,6 +314,56 @@ impl PlaytimeApp {
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(handle) = self.monitor_handle.take() {
             let _ = handle.join();
+        }
+    }
+
+    #[cfg(windows)]
+    fn process_tray(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if self.first_frame {
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+            ctx.send_viewport_cmd(ViewportCommand::SkipTaskbar(true));
+            self.first_frame = false;
+        }
+
+        if let Some(tray) = &self.tray {
+            while let Some(event) = tray.poll() {
+                match event {
+                    TrayEvent::MenuItemClick { id, .. } => {
+                        if id == tray.show_id {
+                            self.pending_show = true;
+                        } else if id == tray.exit_id {
+                            self.pending_exit = true;
+                        }
+                    }
+                    TrayEvent::DoubleClick { .. } | TrayEvent::LeftClick { .. } => {
+                        self.pending_show = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if self.pending_exit {
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+            self.pending_exit = false;
+            return;
+        }
+
+        if self.pending_hide {
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.pending_hide = false;
+        }
+
+        if self.pending_show {
+            ctx.send_viewport_cmd(ViewportCommand::SkipTaskbar(false));
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(ViewportCommand::RequestFocus);
+            ctx.send_viewport_cmd(ViewportCommand::SkipTaskbar(true));
+            self.pending_show = false;
         }
     }
 
@@ -1341,9 +1493,12 @@ impl PlaytimeApp {
 }
 
 impl eframe::App for PlaytimeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.maybe_clear_status();
         self.ensure_style(ctx);
+
+        #[cfg(windows)]
+        self.process_tray(ctx, frame);
 
         if self.last_refresh.elapsed() >= self.refresh_interval {
             self.refresh_sessions();
@@ -1377,6 +1532,19 @@ impl eframe::App for PlaytimeApp {
         });
 
         ctx.request_repaint_after(self.refresh_interval);
+    }
+
+    fn on_close_event(&mut self) -> bool {
+        #[cfg(windows)]
+        {
+            self.pending_hide = true;
+            false
+        }
+
+        #[cfg(not(windows))]
+        {
+            true
+        }
     }
 }
 

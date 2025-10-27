@@ -62,4 +62,8 @@ star_citizen_playtime.exe uninstall-startup
 
 ## Distributing a Single EXE
 
+> ⚠️ **Code-Signing Notice**
+>
+> The published binaries are currently unsigned. Windows SmartScreen (and some antivirus tools) will prompt the first time you run them. This project is fully open source, so you can either acknowledge the prompt or build your own executable from source if you prefer a locally trusted binary.
+
 For a portable executable you can share, copy `target\release\star_citizen_playtime.exe`. The binary has no external dependencies and can be registered for auto-start on any Windows machine with a single command (as shown above).

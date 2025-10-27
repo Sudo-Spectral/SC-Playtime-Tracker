@@ -1,6 +1,6 @@
 [package]
 name = "star_citizen_playtime"
-version = "0.9.3"
+version = "1.0.1"
 edition = "2024"
 authors = ["Al1e"]
 description = "Lightweight Star Citizen playtime tracker"
@@ -25,3 +25,4 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.50"
+tray-icon = "0.9"

@@ -6,6 +6,10 @@ This document walks through turning the bundled `leaderboard_server` binary into
 - expose it over HTTPS with your own domain
 - bake the service URL into released dashboard builds so players never have to configure anything
 
+> ⚠️ **Unsigned Binary Warning**
+>
+> The distributed desktop binaries are currently unsigned, so Windows may show a SmartScreen warning the first time they’re launched. The project is open source—feel free to build from source if you want a copy signed with your own trust chain.
+
 ---
 
 ## 1. Prerequisites
