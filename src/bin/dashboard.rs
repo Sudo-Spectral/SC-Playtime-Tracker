@@ -3,9 +3,9 @@
 use std::{
     collections::HashSet,
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
-        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -15,8 +15,8 @@ use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use eframe::egui::epaint::Shadow;
 use eframe::egui::{
-    self, style::Visuals, Color32, Frame, Grid, Margin, RichText, Rounding, ScrollArea, Stroke,
-    Vec2b, ViewportCommand,
+    self, Color32, Frame, Grid, Margin, RichText, Rounding, ScrollArea, Stroke, Vec2b,
+    ViewportCommand, style::Visuals,
 };
 use egui_plot::{Bar, BarChart, Legend, Plot, PlotBounds, PlotPoint};
 use rfd::FileDialog;
@@ -34,9 +34,8 @@ use std::{env, process::Command};
 
 #[cfg(windows)]
 use tray_icon::{
-    icon::Icon,
-    menu::{MenuBuilder, MenuId, MenuItemBuilder, PredefinedMenuItem},
-    TrayEvent, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    ClickType, Icon, TrayIcon, TrayIconBuilder, TrayIconEvent, TrayIconId,
+    menu::{Menu, MenuEvent, MenuId, MenuItemBuilder, PredefinedMenuItem},
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -47,41 +46,34 @@ enum DashboardTab {
 
 #[cfg(windows)]
 struct TrayController {
-    icon: TrayIcon,
+    _icon: TrayIcon,
+    icon_id: TrayIconId,
     show_id: MenuId,
     exit_id: MenuId,
-    event_rx: std::sync::mpsc::Receiver<TrayEvent>,
 }
 
 #[cfg(windows)]
 impl TrayController {
     fn new() -> Option<Self> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        TrayIconEvent::set_event_handler(Some(move |event| {
-            let _ = tx.send(event.clone());
-        }));
-
         let show_id = MenuId::new("open_dashboard");
         let exit_id = MenuId::new("quit_dashboard");
 
-        let menu = MenuBuilder::new()
-            .item(
-                &MenuItemBuilder::new()
-                    .id(show_id)
-                    .text("Open Dashboard")
-                    .build()
-                    .ok()?,
-            )
-            .separator(&PredefinedMenuItem::separator())
-            .item(
-                &MenuItemBuilder::new()
-                    .id(exit_id)
-                    .text("Quit")
-                    .build()
-                    .ok()?,
-            )
-            .build()
-            .ok()?;
+        let show_item = MenuItemBuilder::new()
+            .id(show_id.clone())
+            .text("Open Dashboard")
+            .build();
+
+        let exit_item = MenuItemBuilder::new()
+            .id(exit_id.clone())
+            .text("Quit")
+            .build();
+
+        let separator = PredefinedMenuItem::separator();
+
+        let menu = Menu::new();
+        menu.append(&show_item).ok()?;
+        menu.append(&separator).ok()?;
+        menu.append(&exit_item).ok()?;
 
         let icon = Icon::from_rgba(Self::icon_pixels(), 16, 16).ok()?;
 
@@ -93,10 +85,10 @@ impl TrayController {
             .ok()?;
 
         Some(Self {
-            icon,
+            icon_id: icon.id().clone(),
+            _icon: icon,
             show_id,
             exit_id,
-            event_rx: rx,
         })
     }
 
@@ -108,16 +100,35 @@ impl TrayController {
         data
     }
 
-    fn poll(&self) -> Option<TrayEvent> {
-        self.event_rx.try_recv().ok()
+    fn drain_actions<F>(&self, mut on_action: F)
+    where
+        F: FnMut(TrayAction),
+    {
+        let tray_events = TrayIconEvent::receiver();
+        while let Ok(event) = tray_events.try_recv() {
+            if event.id == self.icon_id
+                && matches!(event.click_type, ClickType::Left | ClickType::Double)
+            {
+                on_action(TrayAction::Show);
+            }
+        }
+
+        let menu_events = MenuEvent::receiver();
+        while let Ok(event) = menu_events.try_recv() {
+            if event.id == self.show_id {
+                on_action(TrayAction::Show);
+            } else if event.id == self.exit_id {
+                on_action(TrayAction::Exit);
+            }
+        }
     }
 }
 
 #[cfg(windows)]
-impl Drop for TrayController {
-    fn drop(&mut self) {
-        TrayIconEvent::set_event_handler(None);
-    }
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TrayAction {
+    Show,
+    Exit,
 }
 
 fn main() -> Result<()> {
@@ -154,7 +165,15 @@ fn main() -> Result<()> {
         Some(status_notes.join("\n"))
     };
 
-    let native_options = eframe::NativeOptions::default();
+    let mut native_options = eframe::NativeOptions::default();
+    #[cfg(windows)]
+    {
+        native_options.viewport = native_options
+            .viewport
+            .clone()
+            .with_visible(false)
+            .with_taskbar(false);
+    }
     eframe::run_native(
         "Star Citizen Playtime",
         native_options,
@@ -204,6 +223,8 @@ struct PlaytimeApp {
     pending_show: bool,
     #[cfg(windows)]
     pending_exit: bool,
+    #[cfg(windows)]
+    exit_ready: bool,
 }
 
 #[derive(Default)]
@@ -269,6 +290,8 @@ impl PlaytimeApp {
             pending_show: false,
             #[cfg(windows)]
             pending_exit: false,
+            #[cfg(windows)]
+            exit_ready: false,
         };
         app.refresh_sessions();
         app.start_monitor();
@@ -318,52 +341,53 @@ impl PlaytimeApp {
     }
 
     #[cfg(windows)]
-    fn process_tray(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn process_tray(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.first_frame {
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
             ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-            ctx.send_viewport_cmd(ViewportCommand::SkipTaskbar(true));
             self.first_frame = false;
         }
 
         if let Some(tray) = &self.tray {
-            while let Some(event) = tray.poll() {
-                match event {
-                    TrayEvent::MenuItemClick { id, .. } => {
-                        if id == tray.show_id {
-                            self.pending_show = true;
-                        } else if id == tray.exit_id {
-                            self.pending_exit = true;
-                        }
-                    }
-                    TrayEvent::DoubleClick { .. } | TrayEvent::LeftClick { .. } => {
-                        self.pending_show = true;
-                    }
-                    _ => {}
+            tray.drain_actions(|action| match action {
+                TrayAction::Show => {
+                    self.pending_show = true;
+                    self.pending_hide = false;
                 }
-            }
+                TrayAction::Exit => {
+                    self.pending_exit = true;
+                }
+            });
         }
 
         if self.pending_exit {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(ViewportCommand::Close);
             self.pending_exit = false;
+            self.exit_ready = true;
+            self.pending_show = false;
+            self.pending_hide = false;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
 
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested && !self.exit_ready {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.pending_hide = true;
+        }
+
         if self.pending_hide {
+            self.pending_hide = false;
+            self.pending_show = false;
             ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-            self.pending_hide = false;
         }
 
         if self.pending_show {
-            ctx.send_viewport_cmd(ViewportCommand::SkipTaskbar(false));
+            self.pending_show = false;
+            self.exit_ready = false;
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(ViewportCommand::RequestFocus);
-            ctx.send_viewport_cmd(ViewportCommand::SkipTaskbar(true));
-            self.pending_show = false;
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
         }
     }
 
@@ -1532,19 +1556,6 @@ impl eframe::App for PlaytimeApp {
         });
 
         ctx.request_repaint_after(self.refresh_interval);
-    }
-
-    fn on_close_event(&mut self) -> bool {
-        #[cfg(windows)]
-        {
-            self.pending_hide = true;
-            false
-        }
-
-        #[cfg(not(windows))]
-        {
-            true
-        }
     }
 }
 

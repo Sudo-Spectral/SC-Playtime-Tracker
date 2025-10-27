@@ -215,7 +215,9 @@ pub fn compute_analytics(sessions: &[Session]) -> Analytics {
     let mut weekly_totals: BTreeMap<(i32, u32), f64> = BTreeMap::new();
     for (day, minutes) in &daily_totals {
         let iso_week = day.iso_week();
-        *weekly_totals.entry((iso_week.year(), iso_week.week())).or_default() += minutes;
+        *weekly_totals
+            .entry((iso_week.year(), iso_week.week()))
+            .or_default() += minutes;
     }
 
     let recent_sessions = {

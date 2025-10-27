@@ -1,5 +1,8 @@
 use std::{
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -8,7 +11,9 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use sysinfo::System;
 
-use crate::storage::{active_session_minutes, format_duration, ActiveSession, Session, SessionStore};
+use crate::storage::{
+    ActiveSession, Session, SessionStore, active_session_minutes, format_duration,
+};
 
 const PROCESS_TOKENS: [&str; 4] = [
     "starcitizen",
@@ -63,7 +68,9 @@ impl Monitor {
                 session.start.format("%Y-%m-%d %H:%M:%S")
             );
             if !is_game_running(&system) {
-                if let Some(saved) = finalize_session(&store, session.clone(), self.min_session_minutes)? {
+                if let Some(saved) =
+                    finalize_session(&store, session.clone(), self.min_session_minutes)?
+                {
                     println!(
                         "Recovered session saved: {} for {}",
                         saved.start.format("%Y-%m-%d %H:%M:%S"),

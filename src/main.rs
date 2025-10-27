@@ -1,10 +1,10 @@
-use std::{path::PathBuf, sync::atomic::AtomicBool, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, sync::atomic::AtomicBool, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use star_citizen_playtime::monitor::Monitor;
 use star_citizen_playtime::startup;
-use star_citizen_playtime::storage::{compute_analytics, format_duration, SessionStore};
+use star_citizen_playtime::storage::{SessionStore, compute_analytics, format_duration};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Star Citizen playtime tracker", long_about = None)]
@@ -97,12 +97,7 @@ fn run_report() -> Result<()> {
     );
     println!("\nTop play days:");
     for (idx, entry) in analytics.top_days.iter().enumerate() {
-        println!(
-            " {}. {} — {}",
-            idx + 1,
-            entry.0,
-            format_duration(entry.1)
-        );
+        println!(" {}. {} — {}", idx + 1, entry.0, format_duration(entry.1));
     }
     println!("\nRecent sessions:");
     for session in &analytics.recent_sessions {

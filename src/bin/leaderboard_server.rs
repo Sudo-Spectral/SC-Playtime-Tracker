@@ -1,20 +1,15 @@
-use std::{
-    env,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use serde::Deserialize;
-use star_citizen_playtime::leaderboard::{update_local_entries, LeaderboardEntry};
+use star_citizen_playtime::leaderboard::{LeaderboardEntry, update_local_entries};
 use tokio::{fs, net::TcpListener, sync::RwLock};
 
 struct LeaderboardState {
@@ -105,7 +100,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
         .parse()
         .context("Invalid LEADERBOARD_ADDR value")?;
-    let data_path = PathBuf::from(env::var("LEADERBOARD_STORE").unwrap_or_else(|_| "leaderboard-data.json".to_string()));
+    let data_path = PathBuf::from(
+        env::var("LEADERBOARD_STORE").unwrap_or_else(|_| "leaderboard-data.json".to_string()),
+    );
 
     let state = Arc::new(LeaderboardState::load(data_path).await?);
 
@@ -139,7 +136,10 @@ async fn submit_handler(
         return Err((StatusCode::BAD_REQUEST, "Username is required".into()));
     }
     if !payload.total_minutes.is_finite() || payload.total_minutes < 0.0 {
-        return Err((StatusCode::BAD_REQUEST, "total_minutes must be a non-negative number".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "total_minutes must be a non-negative number".into(),
+        ));
     }
 
     state
