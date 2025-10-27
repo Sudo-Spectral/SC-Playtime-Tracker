@@ -14,6 +14,7 @@ pub struct AppSettings {
     pub show_weekly_chart: bool,
     pub sync_leaderboard: bool,
     pub leaderboard_username: String,
+    pub leaderboard_endpoint: String,
 }
 
 impl Default for AppSettings {
@@ -27,6 +28,7 @@ impl Default for AppSettings {
             show_weekly_chart: true,
             sync_leaderboard: true,
             leaderboard_username: String::new(),
+            leaderboard_endpoint: String::new(),
         }
     }
 }
@@ -42,6 +44,10 @@ impl AppSettings {
         self.leaderboard_username = self.leaderboard_username.trim().to_string();
         if self.leaderboard_username.len() > 32 {
             self.leaderboard_username.truncate(32);
+        }
+        self.leaderboard_endpoint = self.leaderboard_endpoint.trim().to_string();
+        if self.leaderboard_endpoint.len() > 2048 {
+            self.leaderboard_endpoint.truncate(2048);
         }
     }
 }

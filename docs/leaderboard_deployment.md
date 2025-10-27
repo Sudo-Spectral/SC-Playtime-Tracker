@@ -147,9 +147,12 @@ sudo systemctl reload nginx
 
 You want desktop clients to ship with the production endpoint baked in. The leaderboard client checks:
 
-1. `PLAYTIME_LEADERBOARD_URL` (runtime override)
-2. `LEADERBOARD_DEFAULT_URL` (compile-time constant)
-3. local fallback file if neither is set
+1. the persisted endpoint configured in the dashboard settings
+2. `PLAYTIME_LEADERBOARD_URL` (runtime override)
+3. `LEADERBOARD_DEFAULT_URL` (compile-time constant)
+4. local fallback file if none of the above are set
+
+Users can change the endpoint at runtime from **Settings → Leaderboard Sync**. Leaving the field blank keeps the baked-in default or local fallback.
 
 Build releases like this (replace the URL with your domain):
 

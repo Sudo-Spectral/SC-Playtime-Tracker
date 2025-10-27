@@ -3,18 +3,21 @@
 use std::{
     collections::HashSet,
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
-        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Local, NaiveDate};
-use eframe::egui::{self, style::Visuals, Color32, Frame, Grid, Margin, RichText, Rounding, ScrollArea, Stroke, Vec2b};
 use eframe::egui::epaint::Shadow;
+use eframe::egui::{
+    self, Color32, Frame, Grid, Margin, RichText, Rounding, ScrollArea, Stroke, Vec2b,
+    style::Visuals,
+};
 use egui_plot::{Bar, BarChart, Legend, Plot, PlotBounds, PlotPoint};
 use rfd::FileDialog;
 use star_citizen_playtime::leaderboard::{LeaderboardClient, LeaderboardEntry};
@@ -23,7 +26,7 @@ use star_citizen_playtime::settings::{AppSettings, SettingsStore};
 #[cfg(windows)]
 use star_citizen_playtime::startup;
 use star_citizen_playtime::storage::{
-    active_session_minutes, compute_analytics, format_duration, Analytics, Session, SessionStore,
+    Analytics, Session, SessionStore, active_session_minutes, compute_analytics, format_duration,
 };
 
 #[cfg(windows)]
@@ -119,7 +122,10 @@ struct LeaderboardSyncResult {
 }
 
 enum LeaderboardJob {
-    SubmitAndFetch { username: String, total_minutes: f64 },
+    SubmitAndFetch {
+        username: String,
+        total_minutes: f64,
+    },
     FetchOnly,
 }
 
@@ -210,7 +216,15 @@ impl PlaytimeApp {
     }
 
     fn initialize_leaderboard_client(&mut self) {
-        match LeaderboardClient::auto(self.store.data_dir()) {
+        let override_endpoint = {
+            let candidate = self.settings.leaderboard_endpoint.trim();
+            if candidate.is_empty() {
+                None
+            } else {
+                Some(candidate)
+            }
+        };
+        match LeaderboardClient::auto(self.store.data_dir(), override_endpoint) {
             Ok(client) => {
                 self.leaderboard_client = Some(client);
             }
@@ -254,22 +268,16 @@ impl PlaytimeApp {
                 } => {
                     match client.submit_total_minutes(&username, total_minutes) {
                         Ok(()) => {
-                            outcome.message = Some(format!(
-                                "Leaderboard synced for {username}."
-                            ));
+                            outcome.message = Some(format!("Leaderboard synced for {username}."));
                         }
                         Err(err) => {
-                            outcome.error = Some(format!(
-                                "Failed to sync leaderboard: {err}"
-                            ));
+                            outcome.error = Some(format!("Failed to sync leaderboard: {err}"));
                         }
                     }
                     match client.fetch_top_entries() {
                         Ok(entries) => outcome.entries = Some(entries),
                         Err(err) => {
-                            let message = format!(
-                                "Failed to refresh leaderboard entries: {err}"
-                            );
+                            let message = format!("Failed to refresh leaderboard entries: {err}");
                             outcome.error = Some(match outcome.error.take() {
                                 Some(existing) => format!("{existing} | {message}"),
                                 None => message,
@@ -280,9 +288,8 @@ impl PlaytimeApp {
                 LeaderboardJob::FetchOnly => match client.fetch_top_entries() {
                     Ok(entries) => outcome.entries = Some(entries),
                     Err(err) => {
-                        outcome.error = Some(format!(
-                            "Failed to refresh leaderboard entries: {err}"
-                        ));
+                        outcome.error =
+                            Some(format!("Failed to refresh leaderboard entries: {err}"));
                     }
                 },
             }
@@ -347,7 +354,9 @@ impl PlaytimeApp {
             let username = self.settings.leaderboard_username.trim();
             if username.is_empty() {
                 if self.leaderboard_entries.is_empty() {
-                    self.set_status("Add a leaderboard username in settings to appear on the leaderboard.");
+                    self.set_status(
+                        "Add a leaderboard username in settings to appear on the leaderboard.",
+                    );
                 }
                 self.start_leaderboard_job(LeaderboardJob::FetchOnly);
                 return;
@@ -399,10 +408,9 @@ impl PlaytimeApp {
     fn apply_monitor_settings(&mut self) {
         let mut new_settings = self.pending_settings.clone();
         new_settings.sanitize();
-        let changed =
-            new_settings.poll_seconds != self.settings.poll_seconds
-                || new_settings.min_session_minutes != self.settings.min_session_minutes
-                || new_settings.refresh_seconds != self.settings.refresh_seconds;
+        let changed = new_settings.poll_seconds != self.settings.poll_seconds
+            || new_settings.min_session_minutes != self.settings.min_session_minutes
+            || new_settings.refresh_seconds != self.settings.refresh_seconds;
 
         if !changed {
             self.pending_settings = self.settings.clone();
@@ -431,7 +439,8 @@ impl PlaytimeApp {
     fn apply_leaderboard_settings(&mut self) {
         self.pending_settings.sanitize();
         let changed = self.settings.sync_leaderboard != self.pending_settings.sync_leaderboard
-            || self.settings.leaderboard_username != self.pending_settings.leaderboard_username;
+            || self.settings.leaderboard_username != self.pending_settings.leaderboard_username
+            || self.settings.leaderboard_endpoint != self.pending_settings.leaderboard_endpoint;
 
         if !changed {
             self.set_status("Leaderboard settings already applied.");
@@ -440,8 +449,10 @@ impl PlaytimeApp {
 
         self.settings.sync_leaderboard = self.pending_settings.sync_leaderboard;
         self.settings.leaderboard_username = self.pending_settings.leaderboard_username.clone();
-    self.pending_settings.sync_leaderboard = self.settings.sync_leaderboard;
-    self.pending_settings.leaderboard_username = self.settings.leaderboard_username.clone();
+        self.settings.leaderboard_endpoint = self.pending_settings.leaderboard_endpoint.clone();
+        self.pending_settings.sync_leaderboard = self.settings.sync_leaderboard;
+        self.pending_settings.leaderboard_username = self.settings.leaderboard_username.clone();
+        self.pending_settings.leaderboard_endpoint = self.settings.leaderboard_endpoint.clone();
 
         let save_result = self.settings_store.save(&self.settings);
 
@@ -578,41 +589,39 @@ impl PlaytimeApp {
     }
 
     fn render_summary_cards(&self, ui: &mut egui::Ui) {
-        let cards: Vec<(&'static str, String, String, Color32)> = if let Some(analytics) = &self.analytics
-        {
-            vec![
-                (
-                    "Total hours",
-                    format!("{:.1}", analytics.total_minutes / 60.0),
-                    format!("Across {} sessions", analytics.total_sessions),
-                    Color32::from_rgb(86, 156, 214),
-                ),
-                (
-                    "Average session",
-                    format_duration(analytics.average_session_minutes),
-                    format!(
-                        "Median {}",
-                        format_duration(analytics.median_session_minutes)
+        let cards: Vec<(&'static str, String, String, Color32)> =
+            if let Some(analytics) = &self.analytics {
+                vec![
+                    (
+                        "Total hours",
+                        format!("{:.1}", analytics.total_minutes / 60.0),
+                        format!("Across {} sessions", analytics.total_sessions),
+                        Color32::from_rgb(86, 156, 214),
                     ),
-                    Color32::from_rgb(170, 120, 255),
-                ),
-                (
-                    "Last 7 days",
-                    format!("{:.1}", analytics.minutes_last_7 / 60.0),
-                    format!("30-day total {:.1} h", analytics.minutes_last_30 / 60.0),
-                    Color32::from_rgb(255, 170, 90),
-                ),
-            ]
-        } else {
-            vec![
-                (
+                    (
+                        "Average session",
+                        format_duration(analytics.average_session_minutes),
+                        format!(
+                            "Median {}",
+                            format_duration(analytics.median_session_minutes)
+                        ),
+                        Color32::from_rgb(170, 120, 255),
+                    ),
+                    (
+                        "Last 7 days",
+                        format!("{:.1}", analytics.minutes_last_7 / 60.0),
+                        format!("30-day total {:.1} h", analytics.minutes_last_30 / 60.0),
+                        Color32::from_rgb(255, 170, 90),
+                    ),
+                ]
+            } else {
+                vec![(
                     "No sessions yet",
                     String::from("—"),
                     String::from("Launch Star Citizen to begin tracking."),
                     Color32::from_rgb(140, 140, 160),
-                ),
-            ]
-        };
+                )]
+            };
 
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
@@ -750,16 +759,18 @@ impl PlaytimeApp {
             ui.label("No sessions recorded yet.");
             return;
         }
-        Grid::new("recent_sessions_grid").striped(true).show(ui, |grid| {
-            grid.label(RichText::new("Start").strong());
-            grid.label(RichText::new("Duration").strong());
-            grid.end_row();
-            for session in self.sessions.iter().rev().take(12) {
-                grid.label(session.start.format("%Y-%m-%d %H:%M").to_string());
-                grid.label(format_duration(session.duration_minutes));
+        Grid::new("recent_sessions_grid")
+            .striped(true)
+            .show(ui, |grid| {
+                grid.label(RichText::new("Start").strong());
+                grid.label(RichText::new("Duration").strong());
                 grid.end_row();
-            }
-        });
+                for session in self.sessions.iter().rev().take(12) {
+                    grid.label(session.start.format("%Y-%m-%d %H:%M").to_string());
+                    grid.label(format_duration(session.duration_minutes));
+                    grid.end_row();
+                }
+            });
     }
 
     fn render_charts(&self, ui: &mut egui::Ui, analytics: &Analytics) {
@@ -788,11 +799,8 @@ impl PlaytimeApp {
 
         let today = Local::now().date_naive();
         let cutoff_7 = today - ChronoDuration::days(6);
-        let session_days: HashSet<NaiveDate> = self
-            .sessions
-            .iter()
-            .map(|s| s.start.date_naive())
-            .collect();
+        let session_days: HashSet<NaiveDate> =
+            self.sessions.iter().map(|s| s.start.date_naive()).collect();
 
         let sessions_last_7: usize = self
             .sessions
@@ -862,18 +870,20 @@ impl PlaytimeApp {
         if self.leaderboard_entries.is_empty() {
             ui.label("No leaderboard data yet.");
         } else {
-            Grid::new("leaderboard_grid").striped(true).show(ui, |grid| {
-                grid.label(RichText::new("#").strong());
-                grid.label(RichText::new("Commander").strong());
-                grid.label(RichText::new("Hours").strong());
-                grid.end_row();
-                for (idx, entry) in self.leaderboard_entries.iter().enumerate() {
-                    grid.label((idx + 1).to_string());
-                    grid.label(entry.username.clone());
-                    grid.label(format!("{:.2}", entry.total_minutes / 60.0));
+            Grid::new("leaderboard_grid")
+                .striped(true)
+                .show(ui, |grid| {
+                    grid.label(RichText::new("#").strong());
+                    grid.label(RichText::new("Commander").strong());
+                    grid.label(RichText::new("Hours").strong());
                     grid.end_row();
-                }
-            });
+                    for (idx, entry) in self.leaderboard_entries.iter().enumerate() {
+                        grid.label((idx + 1).to_string());
+                        grid.label(entry.username.clone());
+                        grid.label(format!("{:.2}", entry.total_minutes / 60.0));
+                        grid.end_row();
+                    }
+                });
         }
 
         if let Some(success) = self.last_leaderboard_success {
@@ -1133,12 +1143,46 @@ impl PlaytimeApp {
                 ui.label("Leaderboard username");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.pending_settings.leaderboard_username)
-                        .hint_text("Commander name"),
+                        .hint_text("Commander name")
+                        .desired_width(200.0),
                 );
             });
 
+            ui.horizontal(|ui| {
+                ui.label("Leaderboard endpoint");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.pending_settings.leaderboard_endpoint)
+                        .hint_text("https://playtracker.example.com")
+                        .desired_width(280.0),
+                );
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Leave blank to use the baked-in endpoint or fall back to local storage.",
+                )
+                .small(),
+            );
+
             if ui.button("Apply leaderboard settings").clicked() {
                 self.apply_leaderboard_settings();
+            }
+
+            match &self.leaderboard_client {
+                Some(LeaderboardClient::Remote { endpoint, .. }) => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Active remote endpoint: {}",
+                            endpoint.as_ref()
+                        ))
+                        .small(),
+                    );
+                }
+                Some(LeaderboardClient::Local { .. }) => {
+                    ui.label(egui::RichText::new("Using local leaderboard storage.").small());
+                }
+                None => {
+                    ui.label(egui::RichText::new("Leaderboard client unavailable.").small());
+                }
             }
 
             if self.settings.sync_leaderboard {
@@ -1154,7 +1198,10 @@ impl PlaytimeApp {
                 }
 
                 if ui
-                    .add_enabled(!self.leaderboard_inflight, egui::Button::new("Sync leaderboard now"))
+                    .add_enabled(
+                        !self.leaderboard_inflight,
+                        egui::Button::new("Sync leaderboard now"),
+                    )
                     .clicked()
                 {
                     self.force_leaderboard_sync();
@@ -1187,10 +1234,7 @@ impl PlaytimeApp {
         {
             match self.store.export_csv(&path, &self.sessions) {
                 Ok((count, actual)) => {
-                    self.set_status(format!(
-                        "Exported {count} sessions to {}",
-                        actual.display()
-                    ));
+                    self.set_status(format!("Exported {count} sessions to {}", actual.display()));
                 }
                 Err(err) => {
                     self.set_status(format!("Failed to export sessions: {err}"));
@@ -1321,11 +1365,9 @@ impl eframe::App for PlaytimeApp {
             ui.separator();
             ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    match self.selected_tab {
-                        DashboardTab::Overview => self.render_overview_tab(ui, &snapshot),
-                        DashboardTab::Insights => self.render_insights_tab(ui, &snapshot),
-                    }
+                .show(ui, |ui| match self.selected_tab {
+                    DashboardTab::Overview => self.render_overview_tab(ui, &snapshot),
+                    DashboardTab::Insights => self.render_insights_tab(ui, &snapshot),
                 });
 
             if let Some(message) = &self.status_message {

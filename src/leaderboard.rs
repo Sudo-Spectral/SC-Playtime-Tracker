@@ -1,32 +1,29 @@
 use std::{
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use once_cell::sync::Lazy;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
+fn normalize_endpoint(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 static DEFAULT_ENDPOINT: Lazy<Option<String>> = Lazy::new(|| {
-    if let Ok(value) = env::var("PLAYTIME_LEADERBOARD_URL") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-
-    if let Some(value) = option_env!("LEADERBOARD_DEFAULT_URL") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-
-    None
+    env::var("PLAYTIME_LEADERBOARD_URL")
+        .ok()
+        .and_then(|value| normalize_endpoint(&value))
+        .or_else(|| option_env!("LEADERBOARD_DEFAULT_URL").and_then(normalize_endpoint))
 });
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,26 +40,18 @@ struct SubmitPayload {
 
 #[derive(Clone)]
 pub enum LeaderboardClient {
-    Remote {
-        client: Client,
-        endpoint: Arc<str>,
-    },
-    Local {
-        path: Arc<PathBuf>,
-    },
+    Remote { client: Client, endpoint: Arc<str> },
+    Local { path: Arc<PathBuf> },
 }
 
 impl LeaderboardClient {
-    pub fn auto(data_dir: &Path) -> Result<Self> {
+    pub fn auto(data_dir: &Path, override_endpoint: Option<&str>) -> Result<Self> {
+        if let Some(endpoint) = override_endpoint.and_then(normalize_endpoint) {
+            return build_remote_client(endpoint);
+        }
+
         if let Some(endpoint) = DEFAULT_ENDPOINT.as_ref().cloned() {
-            let client = Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .context("Failed to build HTTP client for leaderboard")?;
-            return Ok(Self::Remote {
-                client,
-                endpoint: Arc::from(endpoint.into_boxed_str()),
-            });
+            return build_remote_client(endpoint);
         }
 
         let path = data_dir.join("leaderboard.json");
@@ -128,9 +117,20 @@ impl LeaderboardClient {
     }
 }
 
+fn build_remote_client(endpoint: String) -> Result<LeaderboardClient> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("Failed to build HTTP client for leaderboard")?;
+    Ok(LeaderboardClient::Remote {
+        client,
+        endpoint: Arc::from(endpoint.into_boxed_str()),
+    })
+}
+
 fn read_local_entries(path: &Path) -> Result<Vec<LeaderboardEntry>> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
     let entries: Vec<LeaderboardEntry> = serde_json::from_str(&raw)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
     Ok(entries)
@@ -138,8 +138,7 @@ fn read_local_entries(path: &Path) -> Result<Vec<LeaderboardEntry>> {
 
 fn store_local_entries(path: &Path, entries: &[LeaderboardEntry]) -> Result<()> {
     let payload = serde_json::to_string_pretty(entries)?;
-    fs::write(path, payload)
-        .with_context(|| format!("Failed to write {}", path.display()))
+    fs::write(path, payload).with_context(|| format!("Failed to write {}", path.display()))
 }
 
 pub fn update_local_entries(
