@@ -34,7 +34,7 @@ use std::{env, process::Command};
 
 #[cfg(windows)]
 use tray_icon::{
-    ClickType, Icon, TrayIcon, TrayIconBuilder, TrayIconEvent, TrayIconId,
+    ClickType, Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuId, MenuItemBuilder, PredefinedMenuItem},
 };
 
@@ -47,9 +47,6 @@ enum DashboardTab {
 #[cfg(windows)]
 struct TrayController {
     _icon: TrayIcon,
-    icon_id: TrayIconId,
-    show_id: MenuId,
-    exit_id: MenuId,
     event_rx: std::sync::mpsc::Receiver<TrayAction>,
 }
 
@@ -92,7 +89,7 @@ impl TrayController {
         {
             let tx = tx.clone();
             let icon_id = icon_id.clone();
-            TrayIconEvent::set_event_handler(Some(move |event| {
+            TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
                 if event.id == icon_id
                     && matches!(event.click_type, ClickType::Left | ClickType::Double)
                 {
@@ -104,7 +101,7 @@ impl TrayController {
             let tx = tx.clone();
             let show_id = show_id.clone();
             let exit_id = exit_id.clone();
-            MenuEvent::set_event_handler(Some(move |event| {
+            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
                 if event.id == show_id {
                     let _ = tx.send(TrayAction::Show);
                 } else if event.id == exit_id {
@@ -114,10 +111,7 @@ impl TrayController {
         }
 
         Some(Self {
-            icon_id,
             _icon: icon,
-            show_id,
-            exit_id,
             event_rx: rx,
         })
     }
