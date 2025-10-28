@@ -15,3 +15,4 @@
 # Packaging artifacts
 /packaging/dist/
 /packaging/bundle/
+.gitignore
