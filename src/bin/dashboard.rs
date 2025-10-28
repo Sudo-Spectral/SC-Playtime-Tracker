@@ -49,6 +49,9 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItemBuilder, PredefinedMenuItem},
 };
 
+#[cfg(windows)]
+use velopack::{UpdateCheck, UpdateInfo, UpdateManager, VelopackApp, sources::HttpSource};
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum DashboardTab {
     Overview,
@@ -307,7 +310,16 @@ enum TrayAction {
     Exit,
 }
 
+#[cfg(windows)]
+const VELOPACK_FEED_URL: &str = "https://playtracker.al1e.dev/releases/win";
+
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    {
+        let mut velo_app = VelopackApp::build().set_auto_apply_on_startup(true);
+        velo_app.run();
+    }
+
     let snapshot = Arc::new(Mutex::new(MonitorSnapshot::default()));
     let store = Arc::new(SessionStore::new()?);
     let settings_store = SettingsStore::new(store.data_dir().to_path_buf());
@@ -403,6 +415,16 @@ struct PlaytimeApp {
     #[cfg(windows)]
     last_update_log: Instant,
     #[cfg(windows)]
+    update_manager: Option<UpdateManager>,
+    #[cfg(windows)]
+    update_rx: Option<Receiver<UpdateOutcome>>,
+    #[cfg(windows)]
+    update_inflight: bool,
+    #[cfg(windows)]
+    last_update_attempt: Option<Instant>,
+    #[cfg(windows)]
+    update_check_interval: Duration,
+    #[cfg(windows)]
     window_handle: Arc<AtomicIsize>,
 }
 
@@ -411,6 +433,14 @@ struct LeaderboardSyncResult {
     message: Option<String>,
     entries: Option<Vec<LeaderboardEntry>>,
     error: Option<String>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct UpdateOutcome {
+    message: Option<String>,
+    error: Option<String>,
+    update: Option<UpdateInfo>,
 }
 
 enum LeaderboardJob {
@@ -438,6 +468,9 @@ impl PlaytimeApp {
         };
 
         let window_handle = Arc::new(AtomicIsize::new(0));
+
+        #[cfg(windows)]
+        let update_manager = Self::initialize_update_manager();
 
         let mut app = Self {
             store,
@@ -467,7 +500,7 @@ impl PlaytimeApp {
             #[cfg(windows)]
             first_frame: true,
             #[cfg(windows)]
-            pending_hide: true,
+            pending_hide: false,
             #[cfg(windows)]
             pending_show: false,
             #[cfg(windows)]
@@ -478,6 +511,16 @@ impl PlaytimeApp {
             last_tray_tick_log: Instant::now(),
             #[cfg(windows)]
             last_update_log: Instant::now(),
+            #[cfg(windows)]
+            update_manager,
+            #[cfg(windows)]
+            update_rx: None,
+            #[cfg(windows)]
+            update_inflight: false,
+            #[cfg(windows)]
+            last_update_attempt: None,
+            #[cfg(windows)]
+            update_check_interval: Duration::from_secs(3600),
             #[cfg(windows)]
             window_handle,
         };
@@ -529,6 +572,18 @@ impl PlaytimeApp {
         }));
     }
 
+    #[cfg(windows)]
+    fn initialize_update_manager() -> Option<UpdateManager> {
+        let source = HttpSource::new(VELOPACK_FEED_URL);
+        match UpdateManager::new(source, None, None) {
+            Ok(manager) => Some(manager),
+            Err(err) => {
+                eprintln!("Velopack updates unavailable: {err:?}");
+                None
+            }
+        }
+    }
+
     fn stop_monitor(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(handle) = self.monitor_handle.take() {
@@ -537,10 +592,112 @@ impl PlaytimeApp {
     }
 
     #[cfg(windows)]
+    fn maybe_check_for_updates(&mut self) {
+        if self.update_manager.is_none() || self.update_inflight {
+            return;
+        }
+
+        let due = match self.last_update_attempt {
+            Some(last) => last.elapsed() >= self.update_check_interval,
+            None => true,
+        };
+
+        if !due {
+            return;
+        }
+
+        let manager = self.update_manager.as_ref().unwrap().clone();
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        self.update_inflight = true;
+        self.last_update_attempt = Some(Instant::now());
+
+        thread::spawn(move || {
+            let mut outcome = UpdateOutcome::default();
+            match manager.check_for_updates() {
+                Ok(UpdateCheck::UpdateAvailable(info)) => {
+                    let version = info.TargetFullRelease.Version.clone();
+                    match manager.download_updates(&info, None) {
+                        Ok(()) => {
+                            outcome.message =
+                                Some(format!("Update {version} downloaded. Restarting to apply…"));
+                            outcome.update = Some(info);
+                        }
+                        Err(err) => {
+                            outcome.error =
+                                Some(format!("Failed to download update {version}: {err}"));
+                        }
+                    }
+                }
+                Ok(UpdateCheck::RemoteIsEmpty) | Ok(UpdateCheck::NoUpdateAvailable) => {}
+                Err(err) => {
+                    outcome.error = Some(format!("Update check failed: {err}"));
+                }
+            }
+
+            let _ = tx.send(outcome);
+        });
+    }
+
+    #[cfg(windows)]
+    fn poll_update_notifications(&mut self, ctx: &egui::Context) {
+        let outcome = if let Some(rx) = &self.update_rx {
+            match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(UpdateOutcome::default()),
+            }
+        } else {
+            None
+        };
+
+        if let Some(outcome) = outcome {
+            self.update_inflight = false;
+            self.update_rx = None;
+
+            if let Some(error) = outcome.error {
+                self.set_status(error);
+                return;
+            }
+
+            if let Some(message) = outcome.message {
+                self.set_status(message.clone());
+            }
+
+            if let Some(info) = outcome.update {
+                if let Some(manager) = &self.update_manager {
+                    match manager.wait_exit_then_apply_updates(
+                        &info,
+                        true,
+                        true,
+                        std::iter::empty::<String>(),
+                    ) {
+                        Ok(()) => {
+                            self.exit_ready = true;
+                            self.pending_exit = true;
+                            self.pending_hide = false;
+                            self.pending_show = false;
+                            ctx.send_viewport_cmd(ViewportCommand::Close);
+                        }
+                        Err(err) => {
+                            self.set_status(format!("Failed to schedule update: {err}"));
+                        }
+                    }
+                } else {
+                    self.set_status(
+                        "Update downloaded but update manager was unavailable.".to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
     fn process_tray(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.first_frame {
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
             self.first_frame = false;
         }
 
@@ -1766,6 +1923,12 @@ impl eframe::App for PlaytimeApp {
 
         #[cfg(windows)]
         self.process_tray(ctx, frame);
+
+        #[cfg(windows)]
+        self.poll_update_notifications(ctx);
+
+        #[cfg(windows)]
+        self.maybe_check_for_updates();
 
         if self.last_refresh.elapsed() >= self.refresh_interval {
             self.refresh_sessions();

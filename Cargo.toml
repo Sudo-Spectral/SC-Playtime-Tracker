@@ -1,6 +1,6 @@
 [package]
 name = "star_citizen_playtime"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 authors = ["Al1e"]
 description = "Lightweight Star Citizen playtime tracker"
@@ -28,3 +28,4 @@ raw-window-handle = "0.6"
 winreg = "0.50"
 tray-icon = "0.9"
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+velopack = "0.0.1298"

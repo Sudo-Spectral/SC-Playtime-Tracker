@@ -11,3 +11,8 @@
 # VS Code / editor settings
 /.vscode/
 *.log
+
+# Packaging artifacts
+/packaging/dist/
+/packaging/bundle/
+docs/windows_packaging.md

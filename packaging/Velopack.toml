@@ -1,0 +1,30 @@
+# Velopack configuration for Star Citizen Playtime dashboard packaging.
+# See https://docs.velopack.io for full schema and options.
+
+[package]
+id = "com.sudospectral.scplaytime"
+title = "Star Citizen Playtime Tracker"
+version = "1.1.0"
+authors = ["Al1e"]
+summary = "Background tracker and dashboard for Star Citizen playtime."
+license = "MIT"
+
+[build]
+# The CLI copies everything defined in the copy list into `bundle/` before packing.
+workingDir = "bundle"
+output = "dist"
+
+[[build.copy]]
+# Primary dashboard executable built via `cargo build --release --bin dashboard`.
+source = "../target/release/dashboard.exe"
+destination = "Star Citizen Playtime.exe"
+
+[win]
+# Entry point inside the packaged app.
+mainExe = "Star Citizen Playtime.exe"
+shortcutName = "Star Citizen Playtime"
+# Supply an ICO via `icon = "path/to/icon.ico"` once available.
+
+[release]
+baseUrl = "https://playtracker.al1e.dev/releases/win"
+updateUrl = "https://playtracker.al1e.dev/releases/win"

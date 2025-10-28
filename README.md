@@ -67,3 +67,13 @@ star_citizen_playtime.exe uninstall-startup
 > The published binaries are currently unsigned. Windows SmartScreen (and some antivirus tools) will prompt the first time you run them. This project is fully open source, so you can either acknowledge the prompt or build your own executable from source if you prefer a locally trusted binary.
 
 For a portable executable you can share, copy `target\release\star_citizen_playtime.exe`. The binary has no external dependencies and can be registered for auto-start on any Windows machine with a single command (as shown above).
+
+## Packaging (Windows)
+
+A Velopack-based workflow is available to produce an installer for the `dashboard` GUI:
+
+1. Build the dashboard: `cargo build --release --bin dashboard`
+2. Run the helper script: `./packaging/package.ps1`
+3. Grab the generated installer from `packaging/dist`
+
+See `docs/windows_packaging.md` for detailed instructions, configuration notes, and troubleshooting tips.
