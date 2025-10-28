@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicIsize, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
     thread::{self, JoinHandle},
@@ -33,6 +33,17 @@ use star_citizen_playtime::storage::{
 use std::{env, process::Command};
 
 #[cfg(windows)]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::HWND,
+    UI::WindowsAndMessaging::{
+        PostMessageW, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow, WM_CLOSE,
+    },
+};
+
+#[cfg(windows)]
 use tray_icon::{
     ClickType, Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuId, MenuItemBuilder, PredefinedMenuItem},
@@ -48,11 +59,15 @@ enum DashboardTab {
 struct TrayController {
     _icon: TrayIcon,
     event_rx: std::sync::mpsc::Receiver<TrayAction>,
+    repaint_keepalive: Arc<AtomicBool>,
+    _window_handle: Arc<AtomicIsize>,
 }
 
 #[cfg(windows)]
 impl TrayController {
-    fn new() -> Option<Self> {
+    fn new(repaint_ctx: &egui::Context, window_handle: Arc<AtomicIsize>) -> Option<Self> {
+        Self::log_event("initializing tray controller");
+
         let show_id = MenuId::new("open_dashboard");
         let exit_id = MenuId::new("quit_dashboard");
 
@@ -61,58 +76,158 @@ impl TrayController {
             .text("Open Dashboard")
             .enabled(true)
             .build();
-
         let exit_item = MenuItemBuilder::new()
             .id(exit_id.clone())
             .text("Quit")
             .enabled(true)
             .build();
-
         let separator = PredefinedMenuItem::separator();
 
         let menu = Menu::new();
-        menu.append(&show_item).ok()?;
-        menu.append(&separator).ok()?;
-        menu.append(&exit_item).ok()?;
+        if let Err(err) = menu.append(&show_item) {
+            Self::log_event(&format!("failed to append show menu item: {err:?}"));
+            return None;
+        }
+        if let Err(err) = menu.append(&separator) {
+            Self::log_event(&format!("failed to append separator: {err:?}"));
+            return None;
+        }
+        if let Err(err) = menu.append(&exit_item) {
+            Self::log_event(&format!("failed to append exit menu item: {err:?}"));
+            return None;
+        }
 
-        let icon = Icon::from_rgba(Self::icon_pixels(), 16, 16).ok()?;
+        let icon = match Icon::from_rgba(Self::icon_pixels(), 16, 16) {
+            Ok(icon) => icon,
+            Err(err) => {
+                Self::log_event(&format!("failed to create tray icon image: {err:?}"));
+                return None;
+            }
+        };
 
-        let icon = TrayIconBuilder::new()
+        let icon = match TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(icon)
             .with_tooltip("Star Citizen Playtime")
             .build()
-            .ok()?;
+        {
+            Ok(icon) => icon,
+            Err(err) => {
+                Self::log_event(&format!("failed to build tray icon: {err:?}"));
+                return None;
+            }
+        };
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let icon_id = icon.id().clone();
+        let repaint_ctx_icon = repaint_ctx.clone();
+        let icon_window_handle = Arc::clone(&window_handle);
+
         {
             let tx = tx.clone();
-            let icon_id = icon_id.clone();
-            TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-                if event.id == icon_id
-                    && matches!(event.click_type, ClickType::Left | ClickType::Double)
-                {
-                    let _ = tx.send(TrayAction::Show);
+            let icon_id = icon.id().clone();
+            thread::spawn(move || {
+                let tray_events = TrayIconEvent::receiver();
+                loop {
+                    match tray_events.recv() {
+                        Ok(event) => {
+                            TrayController::log_event(&format!(
+                                "tray icon event (worker): {:?}",
+                                event
+                            ));
+                            if event.id == icon_id
+                                && matches!(event.click_type, ClickType::Left | ClickType::Double)
+                            {
+                                if let Err(err) = tx.send(TrayAction::Show) {
+                                    TrayController::log_event(&format!(
+                                        "failed to enqueue TrayAction::Show: {err:?}"
+                                    ));
+                                    break;
+                                }
+                                TrayController::log_event("enqueued TrayAction::Show from icon");
+                                repaint_ctx_icon.request_repaint();
+                                TrayController::show_window(&icon_window_handle);
+                            }
+                        }
+                        Err(err) => {
+                            TrayController::log_event(&format!(
+                                "tray icon event channel closed: {err:?}"
+                            ));
+                            break;
+                        }
+                    }
                 }
-            }));
+            });
         }
+
         {
             let tx = tx.clone();
             let show_id = show_id.clone();
             let exit_id = exit_id.clone();
-            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-                if event.id == show_id {
-                    let _ = tx.send(TrayAction::Show);
-                } else if event.id == exit_id {
-                    let _ = tx.send(TrayAction::Exit);
+            let repaint_ctx_menu = repaint_ctx.clone();
+            let menu_window_handle = Arc::clone(&window_handle);
+            thread::spawn(move || {
+                let menu_events = MenuEvent::receiver();
+                loop {
+                    match menu_events.recv() {
+                        Ok(event) => {
+                            TrayController::log_event(&format!(
+                                "menu event (worker): {:?}",
+                                event.id
+                            ));
+                            if event.id == show_id {
+                                if let Err(err) = tx.send(TrayAction::Show) {
+                                    TrayController::log_event(&format!(
+                                        "failed to enqueue TrayAction::Show: {err:?}"
+                                    ));
+                                    break;
+                                }
+                                TrayController::log_event("enqueued TrayAction::Show from menu");
+                                repaint_ctx_menu.request_repaint();
+                                TrayController::show_window(&menu_window_handle);
+                            } else if event.id == exit_id {
+                                if let Err(err) = tx.send(TrayAction::Exit) {
+                                    TrayController::log_event(&format!(
+                                        "failed to enqueue TrayAction::Exit: {err:?}"
+                                    ));
+                                    break;
+                                }
+                                TrayController::log_event("enqueued TrayAction::Exit from menu");
+                                repaint_ctx_menu.request_repaint();
+                                TrayController::close_window(&menu_window_handle);
+                            }
+                        }
+                        Err(err) => {
+                            TrayController::log_event(&format!(
+                                "menu event channel closed: {err:?}"
+                            ));
+                            break;
+                        }
+                    }
                 }
-            }));
+            });
         }
+
+        let keepalive_flag = Arc::new(AtomicBool::new(true));
+        {
+            let repaint_ctx_keepalive = repaint_ctx.clone();
+            let keepalive_flag_clone = keepalive_flag.clone();
+            thread::spawn(move || {
+                TrayController::log_event("repaint keepalive thread started");
+                while keepalive_flag_clone.load(Ordering::SeqCst) {
+                    repaint_ctx_keepalive.request_repaint();
+                    thread::sleep(Duration::from_millis(250));
+                }
+                TrayController::log_event("repaint keepalive thread exiting");
+            });
+        }
+
+        Self::log_event("tray controller initialized successfully");
 
         Some(Self {
             _icon: icon,
             event_rx: rx,
+            repaint_keepalive: keepalive_flag,
+            _window_handle: window_handle,
         })
     }
 
@@ -124,13 +239,64 @@ impl TrayController {
         data
     }
 
+    fn log_event(msg: &str) {
+        let path = std::env::temp_dir().join("sc_playtime_tray.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{} - {}", chrono::Local::now().to_rfc3339(), msg);
+        }
+    }
+
+    fn hwnd_from(handle: &Arc<AtomicIsize>) -> Option<HWND> {
+        let raw = handle.load(Ordering::SeqCst);
+        if raw == 0 { None } else { Some(raw as HWND) }
+    }
+
+    fn show_window(handle: &Arc<AtomicIsize>) {
+        match Self::hwnd_from(handle) {
+            Some(hwnd) => unsafe {
+                ShowWindow(hwnd, SW_RESTORE);
+                ShowWindow(hwnd, SW_SHOW);
+                let _ = SetForegroundWindow(hwnd);
+            },
+            None => Self::log_event("show requested but window handle unavailable"),
+        }
+    }
+
+    fn close_window(handle: &Arc<AtomicIsize>) {
+        match Self::hwnd_from(handle) {
+            Some(hwnd) => unsafe {
+                let _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            },
+            None => Self::log_event("close requested but window handle unavailable"),
+        }
+    }
+
     fn drain_actions<F>(&self, mut on_action: F)
     where
         F: FnMut(TrayAction),
     {
+        static FIRST_POLL: AtomicBool = AtomicBool::new(true);
+        if FIRST_POLL.swap(false, Ordering::SeqCst) {
+            Self::log_event("tray controller poll started");
+        }
+
         while let Ok(action) = self.event_rx.try_recv() {
+            Self::log_event(&format!("drain_actions received: {:?}", action));
             on_action(action);
         }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TrayController {
+    fn drop(&mut self) {
+        self.repaint_keepalive.store(false, Ordering::SeqCst);
+        Self::log_event("tray controller dropped");
     }
 }
 
@@ -178,17 +344,14 @@ fn main() -> Result<()> {
     let mut native_options = eframe::NativeOptions::default();
     #[cfg(windows)]
     {
-        native_options.viewport = native_options
-            .viewport
-            .clone()
-            .with_visible(false)
-            .with_taskbar(false);
+        native_options.viewport = native_options.viewport.clone().with_taskbar(false);
     }
     eframe::run_native(
         "Star Citizen Playtime",
         native_options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
             Box::new(PlaytimeApp::new(
+                cc,
                 Arc::clone(&store),
                 Arc::clone(&snapshot),
                 settings_store.clone(),
@@ -235,6 +398,12 @@ struct PlaytimeApp {
     pending_exit: bool,
     #[cfg(windows)]
     exit_ready: bool,
+    #[cfg(windows)]
+    last_tray_tick_log: Instant,
+    #[cfg(windows)]
+    last_update_log: Instant,
+    #[cfg(windows)]
+    window_handle: Arc<AtomicIsize>,
 }
 
 #[derive(Default)]
@@ -254,6 +423,7 @@ enum LeaderboardJob {
 
 impl PlaytimeApp {
     fn new(
+        cc: &eframe::CreationContext<'_>,
         store: Arc<SessionStore>,
         snapshot: Arc<Mutex<MonitorSnapshot>>,
         settings_store: SettingsStore,
@@ -266,6 +436,8 @@ impl PlaytimeApp {
             Some(message) => (Some(message), Some(Instant::now())),
             None => (None, None),
         };
+
+        let window_handle = Arc::new(AtomicIsize::new(0));
 
         let mut app = Self {
             store,
@@ -291,7 +463,7 @@ impl PlaytimeApp {
             last_leaderboard_success: None,
             leaderboard_sync_interval: Duration::from_secs(300),
             #[cfg(windows)]
-            tray: TrayController::new(),
+            tray: TrayController::new(&cc.egui_ctx, Arc::clone(&window_handle)),
             #[cfg(windows)]
             first_frame: true,
             #[cfg(windows)]
@@ -302,7 +474,21 @@ impl PlaytimeApp {
             pending_exit: false,
             #[cfg(windows)]
             exit_ready: false,
+            #[cfg(windows)]
+            last_tray_tick_log: Instant::now(),
+            #[cfg(windows)]
+            last_update_log: Instant::now(),
+            #[cfg(windows)]
+            window_handle,
         };
+        #[cfg(windows)]
+        {
+            if app.tray.is_some() {
+                TrayController::log_event("PlaytimeApp acquired tray controller");
+            } else {
+                TrayController::log_event("PlaytimeApp tray controller unavailable");
+            }
+        }
         app.refresh_sessions();
         app.start_monitor();
         app.initialize_leaderboard_client();
@@ -353,24 +539,44 @@ impl PlaytimeApp {
     #[cfg(windows)]
     fn process_tray(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.first_frame {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
             self.first_frame = false;
         }
 
+        let mut tray_actions = Vec::new();
         if let Some(tray) = &self.tray {
-            tray.drain_actions(|action| match action {
+            if self.last_tray_tick_log.elapsed() >= Duration::from_secs(1) {
+                TrayController::log_event("process_tray tick");
+                self.last_tray_tick_log = Instant::now();
+            }
+            tray.drain_actions(|action| tray_actions.push(action));
+            if !tray_actions.is_empty() {
+                TrayController::log_event(&format!(
+                    "app collected {} tray actions",
+                    tray_actions.len()
+                ));
+            }
+        }
+
+        for action in tray_actions {
+            match action {
                 TrayAction::Show => {
                     self.pending_show = true;
                     self.pending_hide = false;
+                    self.set_status("Tray requested dashboard");
+                    TrayController::log_event("app queued pending_show");
                 }
                 TrayAction::Exit => {
                     self.pending_exit = true;
+                    self.set_status("Tray requested exit");
+                    TrayController::log_event("app queued pending_exit");
                 }
-            });
+            }
         }
 
         if self.pending_exit {
+            TrayController::log_event("app processing pending_exit");
             self.pending_exit = false;
             self.exit_ready = true;
             self.pending_show = false;
@@ -383,16 +589,18 @@ impl PlaytimeApp {
         if close_requested && !self.exit_ready {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.pending_hide = true;
+            TrayController::log_event("app queued pending_hide from close");
         }
 
         if self.pending_hide {
+            TrayController::log_event("app processing pending_hide");
             self.pending_hide = false;
             self.pending_show = false;
             ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
 
         if self.pending_show {
+            TrayController::log_event("app processing pending_show");
             self.pending_show = false;
             self.exit_ready = false;
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
@@ -1528,6 +1736,31 @@ impl PlaytimeApp {
 
 impl eframe::App for PlaytimeApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        if self.window_handle.load(Ordering::SeqCst) == 0 {
+            if let Ok(window_handle) = frame.window_handle() {
+                match window_handle.as_raw() {
+                    RawWindowHandle::Win32(handle) => {
+                        let hwnd = handle.hwnd.get() as isize;
+                        if hwnd != 0 {
+                            self.window_handle.store(hwnd, Ordering::SeqCst);
+                            TrayController::log_event(&format!(
+                                "captured window handle: {:?}",
+                                hwnd as usize
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        if self.last_update_log.elapsed() >= Duration::from_secs(1) {
+            TrayController::log_event("update tick");
+            self.last_update_log = Instant::now();
+        }
+
         self.maybe_clear_status();
         self.ensure_style(ctx);
 
@@ -1565,7 +1798,8 @@ impl eframe::App for PlaytimeApp {
             }
         });
 
-        ctx.request_repaint_after(self.refresh_interval);
+        ctx.request_repaint();
+        ctx.request_repaint_after(Duration::from_millis(200));
     }
 }
 

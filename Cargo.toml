@@ -22,7 +22,9 @@ once_cell = "1"
 reqwest = { version = "0.11", features = ["blocking", "json", "rustls-tls"] }
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs"] }
+raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.50"
 tray-icon = "0.9"
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
