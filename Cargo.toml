@@ -1,6 +1,6 @@
 [package]
 name = "star_citizen_playtime"
-version = "1.1.0"
+version = "1.1.3"
 edition = "2024"
 authors = ["Al1e"]
 description = "Lightweight Star Citizen playtime tracker"
@@ -23,6 +23,7 @@ reqwest = { version = "0.11", features = ["blocking", "json", "rustls-tls"] }
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs"] }
 raw-window-handle = "0.6"
+webbrowser = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.50"

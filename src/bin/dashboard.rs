@@ -33,6 +33,9 @@ use star_citizen_playtime::storage::{
 use std::{env, process::Command};
 
 #[cfg(windows)]
+use sysinfo::{System, Signal, get_current_pid};
+
+#[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 #[cfg(windows)]
@@ -51,6 +54,7 @@ use tray_icon::{
 
 #[cfg(windows)]
 use velopack::{UpdateCheck, UpdateInfo, UpdateManager, VelopackApp, sources::HttpSource};
+use webbrowser;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum DashboardTab {
@@ -313,6 +317,67 @@ enum TrayAction {
 #[cfg(windows)]
 const VELOPACK_FEED_URL: &str = "https://playtracker.al1e.dev/releases/win";
 
+const SUPPORT_DISCORD_URL: &str = "https://discord.gg/ebBzRMpnnV";
+
+#[cfg(windows)]
+fn terminate_stale_instances() -> Result<Vec<String>> {
+    let current_pid = get_current_pid().map_err(|err| anyhow!("failed to get current pid: {err}"))?;
+    let mut system = System::new_all();
+    system.refresh_processes();
+
+    let self_name = match env::current_exe()
+        .ok()
+        .and_then(|path| path.file_name()?.to_str().map(|s| s.to_ascii_lowercase()))
+    {
+        Some(name) => name,
+        None => return Ok(Vec::new()),
+    };
+
+    let current_start = match system.process(current_pid) {
+        Some(process) => process.start_time(),
+        None => return Ok(Vec::new()),
+    };
+
+    let mut terminated = Vec::new();
+
+    for (pid, process) in system.processes() {
+        if *pid == current_pid {
+            continue;
+        }
+
+        let mut matches_self = process
+            .exe()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .map(|name| name.eq_ignore_ascii_case(&self_name))
+            .unwrap_or(false);
+
+        if !matches_self {
+            matches_self = process.name().eq_ignore_ascii_case(&self_name);
+        }
+
+        if !matches_self {
+            continue;
+        }
+
+        let process_start = process.start_time();
+        if process_start == 0 || process_start >= current_start {
+            continue;
+        }
+
+        // Prefer SIGTERM equivalent when available; fall back to Kill
+        let killed = process
+            .kill_with(Signal::Term)
+            .unwrap_or_else(|| process.kill());
+
+        if killed {
+            terminated.push(pid.to_string());
+        }
+    }
+
+    Ok(terminated)
+}
+
 fn main() -> Result<()> {
     #[cfg(windows)]
     {
@@ -325,6 +390,26 @@ fn main() -> Result<()> {
     let settings_store = SettingsStore::new(store.data_dir().to_path_buf());
 
     let mut status_notes = Vec::new();
+
+    #[cfg(windows)]
+    {
+        match terminate_stale_instances() {
+            Ok(killed) if !killed.is_empty() => {
+                status_notes.push(format!(
+                    "Closed {} previous instance{} (PID{}: {}).",
+                    killed.len(),
+                    if killed.len() == 1 { "" } else { "s" },
+                    if killed.len() == 1 { "" } else { "s" },
+                    killed.join(", ")
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => status_notes.push(format!(
+                "Failed to check for other running instances: {err}"
+            )),
+        }
+    }
+
     let mut initial_settings = match settings_store.load() {
         Ok(settings) => settings,
         Err(err) => {
@@ -520,7 +605,7 @@ impl PlaytimeApp {
             #[cfg(windows)]
             last_update_attempt: None,
             #[cfg(windows)]
-            update_check_interval: Duration::from_secs(3600),
+            update_check_interval: Duration::from_secs(120),
             #[cfg(windows)]
             window_handle,
         };
@@ -1775,6 +1860,17 @@ impl PlaytimeApp {
             });
 
             ui.label(format!("Data folder: {}", self.store.data_dir().display()));
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Join support (Discord)").clicked() {
+                    if let Err(err) = webbrowser::open(SUPPORT_DISCORD_URL) {
+                        self.set_status(format!("Failed to open browser: {err}"));
+                    } else {
+                        self.set_status("Opening support Discord in your browser...");
+                    }
+                }
+                ui.label(egui::RichText::new("Need help? Join our support server.").small());
+            });
         });
     }
 

@@ -1,4 +1,5 @@
 use std::{
+    env,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -9,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::Local;
-use sysinfo::System;
+use sysinfo::{System, get_current_pid};
 
 use crate::storage::{
     ActiveSession, Session, SessionStore, active_session_minutes, format_duration,
@@ -187,23 +188,45 @@ pub struct MonitorSnapshot {
 }
 
 fn is_game_running(system: &System) -> bool {
+    let current_pid = get_current_pid().ok();
+    let self_exe_name = env::current_exe().ok().and_then(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str().map(|s| s.to_ascii_lowercase()))
+    });
+
     system.processes().values().any(|process| {
-        let name = process.name().to_ascii_lowercase();
-        if PROCESS_TOKENS.iter().any(|token| name.contains(token)) {
-            return true;
+        if current_pid.map(|pid| pid == process.pid()).unwrap_or(false) {
+            return false;
         }
-        if let Some(exe) = process.exe() {
-            if exe
-                .file_name()
-                .and_then(|f| f.to_str())
-                .map(|s| s.to_ascii_lowercase())
-                .map(|s| PROCESS_TOKENS.iter().any(|token| s.contains(token)))
-                .unwrap_or(false)
-            {
-                return true;
+
+        let process_name = process.name().to_ascii_lowercase();
+        if process_name.contains("playtime") {
+            return false;
+        }
+
+        let exe_name_lower = process
+            .exe()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .map(|s| s.to_ascii_lowercase());
+
+        if let (Some(self_name), Some(exe_name)) = (&self_exe_name, &exe_name_lower) {
+            if exe_name == self_name {
+                return false;
             }
         }
-        false
+
+        if PROCESS_TOKENS
+            .iter()
+            .any(|token| process_name.contains(token))
+        {
+            return true;
+        }
+
+        exe_name_lower
+            .as_ref()
+            .map(|exe| PROCESS_TOKENS.iter().any(|token| exe.contains(token)))
+            .unwrap_or(false)
     })
 }
 
