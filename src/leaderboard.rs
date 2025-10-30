@@ -6,8 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use once_cell::sync::Lazy;
-use reqwest::blocking::Client;
+use reqwest::{Url, blocking::Client};
 use serde::{Deserialize, Serialize};
 
 fn normalize_endpoint(value: &str) -> Option<String> {
@@ -19,12 +18,27 @@ fn normalize_endpoint(value: &str) -> Option<String> {
     }
 }
 
-static DEFAULT_ENDPOINT: Lazy<Option<String>> = Lazy::new(|| {
+fn runtime_default_endpoint() -> Option<String> {
     env::var("PLAYTIME_LEADERBOARD_URL")
         .ok()
         .and_then(|value| normalize_endpoint(&value))
-        .or_else(|| option_env!("LEADERBOARD_DEFAULT_URL").and_then(normalize_endpoint))
-});
+}
+
+fn baked_in_default_endpoint() -> Option<String> {
+    option_env!("LEADERBOARD_DEFAULT_URL").and_then(normalize_endpoint)
+}
+
+const FALLBACK_GLOBAL_ENDPOINT: &str = "https://playtracker.al1e.dev";
+
+fn fallback_global_endpoint() -> Option<String> {
+    Some(FALLBACK_GLOBAL_ENDPOINT.to_string())
+}
+
+fn global_remote_endpoint() -> Option<String> {
+    baked_in_default_endpoint()
+        .or_else(runtime_default_endpoint)
+        .or_else(fallback_global_endpoint)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderboardEntry {
@@ -40,27 +54,47 @@ struct SubmitPayload {
 
 #[derive(Clone)]
 pub enum LeaderboardClient {
-    Remote { client: Client, endpoint: Arc<str> },
-    Local { path: Arc<PathBuf> },
+    Remote {
+        client: Client,
+        endpoint: Arc<str>,
+        secondary: Option<Arc<str>>,
+    },
+    Local {
+        path: Arc<PathBuf>,
+    },
 }
 
 impl LeaderboardClient {
     pub fn auto(data_dir: &Path, override_endpoint: Option<&str>) -> Result<Self> {
-        if let Some(endpoint) = override_endpoint.and_then(normalize_endpoint) {
-            return build_remote_client(endpoint);
+        if let Some(raw_override) = override_endpoint {
+            let trimmed = raw_override.trim();
+            if trimmed.eq_ignore_ascii_case("default") || trimmed.eq_ignore_ascii_case("builtin") {
+                if let Some(endpoint) = global_remote_endpoint() {
+                    return build_remote_client(endpoint, None);
+                }
+                return build_local_client(data_dir);
+            }
+
+            if trimmed.eq_ignore_ascii_case("local") {
+                return build_local_client(data_dir);
+            }
+
+            if let Some(endpoint) = normalize_endpoint(trimmed) {
+                let mut secondary = None;
+                if let Some(global) = global_remote_endpoint() {
+                    if !global.eq_ignore_ascii_case(endpoint.as_str()) {
+                        secondary = Some(global);
+                    }
+                }
+                return build_remote_client(endpoint, secondary);
+            }
         }
 
-        if let Some(endpoint) = DEFAULT_ENDPOINT.as_ref().cloned() {
-            return build_remote_client(endpoint);
+        if let Some(endpoint) = global_remote_endpoint() {
+            return build_remote_client(endpoint, None);
         }
 
-        let path = data_dir.join("leaderboard.json");
-        if !path.exists() {
-            fs::write(&path, "[]").context("Failed to initialize local leaderboard storage")?;
-        }
-        Ok(Self::Local {
-            path: Arc::new(path),
-        })
+        build_local_client(data_dir)
     }
 
     pub fn submit_total_minutes(&self, username: &str, total_minutes: f64) -> Result<()> {
@@ -69,22 +103,34 @@ impl LeaderboardClient {
         }
 
         match self {
-            LeaderboardClient::Remote { client, endpoint } => {
-                let url = format!("{}/submit", endpoint.trim_end_matches('/'));
+            LeaderboardClient::Remote {
+                client,
+                endpoint,
+                secondary,
+            } => {
                 let payload = SubmitPayload {
                     username: username.trim().to_string(),
                     total_minutes,
                 };
-                let response = client
-                    .post(url)
-                    .json(&payload)
-                    .send()
-                    .context("Failed to reach leaderboard service")?;
-                if !response.status().is_success() {
-                    return Err(anyhow!(
-                        "Leaderboard sync failed with status {}",
-                        response.status()
-                    ));
+
+                let mut errors = Vec::new();
+                if let Err(err) = submit_payload(client, endpoint, &payload) {
+                    errors.push(err);
+                }
+
+                if let Some(secondary) = secondary {
+                    if let Err(err) = submit_payload(client, secondary, &payload) {
+                        errors.push(err);
+                    }
+                }
+
+                if !errors.is_empty() {
+                    let combined = errors
+                        .into_iter()
+                        .map(|err| err.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    return Err(anyhow!(combined));
                 }
                 Ok(())
             }
@@ -99,25 +145,45 @@ impl LeaderboardClient {
 
     pub fn fetch_top_entries(&self) -> Result<Vec<LeaderboardEntry>> {
         match self {
-            LeaderboardClient::Remote { client, endpoint } => {
-                let url = format!("{}/top", endpoint.trim_end_matches('/'));
+            LeaderboardClient::Remote {
+                client, endpoint, ..
+            } => {
+                let url = build_endpoint_url(endpoint, "top")?;
                 let response = client
                     .get(url)
                     .send()
                     .context("Failed to query leaderboard service")?
                     .error_for_status()
                     .context("Leaderboard service returned an error status")?;
-                let entries: Vec<LeaderboardEntry> = response
+                let payload: LeaderboardResponse = response
                     .json()
                     .context("Failed to parse leaderboard response")?;
-                Ok(entries)
+                Ok(match payload {
+                    LeaderboardResponse::Entries(entries) => entries,
+                    LeaderboardResponse::Wrapped { entries, .. } => entries,
+                })
             }
             LeaderboardClient::Local { path } => read_local_entries(path),
         }
     }
 }
 
-fn build_remote_client(endpoint: String) -> Result<LeaderboardClient> {
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LeaderboardResponse {
+    Entries(Vec<LeaderboardEntry>),
+    Wrapped {
+        entries: Vec<LeaderboardEntry>,
+        #[allow(dead_code)]
+        leaderboard: Option<String>,
+        #[allow(dead_code)]
+        generated_at: Option<String>,
+        #[allow(dead_code)]
+        count: Option<usize>,
+    },
+}
+
+fn build_remote_client(endpoint: String, secondary: Option<String>) -> Result<LeaderboardClient> {
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -125,7 +191,54 @@ fn build_remote_client(endpoint: String) -> Result<LeaderboardClient> {
     Ok(LeaderboardClient::Remote {
         client,
         endpoint: Arc::from(endpoint.into_boxed_str()),
+        secondary: secondary.map(|s| Arc::from(s.into_boxed_str())),
     })
+}
+
+fn build_local_client(data_dir: &Path) -> Result<LeaderboardClient> {
+    let path = data_dir.join("leaderboard.json");
+    if !path.exists() {
+        fs::write(&path, "[]").context("Failed to initialize local leaderboard storage")?;
+    }
+    Ok(LeaderboardClient::Local {
+        path: Arc::new(path),
+    })
+}
+
+fn submit_payload(client: &Client, endpoint: &Arc<str>, payload: &SubmitPayload) -> Result<()> {
+    let url = build_endpoint_url(endpoint, "submit")?;
+    let response = client
+        .post(url)
+        .json(payload)
+        .send()
+        .context("Failed to reach leaderboard service")?;
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "Leaderboard sync failed with status {}",
+            response.status()
+        ));
+    }
+    Ok(())
+}
+
+fn build_endpoint_url(base: &Arc<str>, segment: &str) -> Result<Url> {
+    let mut url =
+        Url::parse(base).with_context(|| format!("Invalid leaderboard endpoint '{}'", base))?;
+    {
+        let trimmed = segment.trim_matches('/');
+        if trimmed.is_empty() {
+            return Ok(url);
+        }
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            anyhow!(
+                "Leaderboard endpoint '{}' cannot accept path segments",
+                base
+            )
+        })?;
+        segments.pop_if_empty();
+        segments.push(trimmed);
+    }
+    Ok(url)
 }
 
 fn read_local_entries(path: &Path) -> Result<Vec<LeaderboardEntry>> {

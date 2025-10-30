@@ -1,6 +1,6 @@
 [package]
 name = "star_citizen_playtime"
-version = "1.1.3"
+version = "1.1.4"
 edition = "2024"
 authors = ["Al1e"]
 description = "Lightweight Star Citizen playtime tracker"
@@ -18,7 +18,6 @@ uuid = { version = "1", features = ["serde", "v4"] }
 eframe = "0.27"
 rfd = "0.14"
 egui_plot = "0.27"
-once_cell = "1"
 reqwest = { version = "0.11", features = ["blocking", "json", "rustls-tls"] }
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs"] }

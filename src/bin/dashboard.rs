@@ -33,7 +33,7 @@ use star_citizen_playtime::storage::{
 use std::{env, process::Command};
 
 #[cfg(windows)]
-use sysinfo::{System, Signal, get_current_pid};
+use sysinfo::{Signal, System, get_current_pid};
 
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -321,7 +321,8 @@ const SUPPORT_DISCORD_URL: &str = "https://discord.gg/ebBzRMpnnV";
 
 #[cfg(windows)]
 fn terminate_stale_instances() -> Result<Vec<String>> {
-    let current_pid = get_current_pid().map_err(|err| anyhow!("failed to get current pid: {err}"))?;
+    let current_pid =
+        get_current_pid().map_err(|err| anyhow!("failed to get current pid: {err}"))?;
     let mut system = System::new_all();
     system.refresh_processes();
 
@@ -997,11 +998,7 @@ impl PlaytimeApp {
                 self.start_leaderboard_job(LeaderboardJob::FetchOnly);
                 return;
             }
-            let total_minutes = self
-                .analytics
-                .as_ref()
-                .map(|analytics| analytics.total_minutes)
-                .unwrap_or(0.0);
+            let total_minutes = self.current_total_minutes();
             self.start_leaderboard_job(LeaderboardJob::SubmitAndFetch {
                 username: username.to_string(),
                 total_minutes,
@@ -1009,6 +1006,28 @@ impl PlaytimeApp {
         } else {
             self.start_leaderboard_job(LeaderboardJob::FetchOnly);
         }
+    }
+
+    fn current_total_minutes(&self) -> f64 {
+        let stored = self
+            .analytics
+            .as_ref()
+            .map(|analytics| analytics.total_minutes)
+            .unwrap_or(0.0);
+
+        let active = self
+            .snapshot
+            .lock()
+            .ok()
+            .and_then(|snapshot| {
+                snapshot
+                    .active_session
+                    .as_ref()
+                    .map(|session| active_session_minutes(session))
+            })
+            .unwrap_or(0.0);
+
+        stored + active
     }
 
     fn force_leaderboard_sync(&mut self) {
@@ -1027,11 +1046,7 @@ impl PlaytimeApp {
                 self.set_status("Enter a leaderboard username before syncing.");
                 return;
             }
-            let total_minutes = self
-                .analytics
-                .as_ref()
-                .map(|analytics| analytics.total_minutes)
-                .unwrap_or(0.0);
+            let total_minutes = self.current_total_minutes();
             self.start_leaderboard_job(LeaderboardJob::SubmitAndFetch {
                 username: username.to_string(),
                 total_minutes,
@@ -1100,20 +1115,34 @@ impl PlaytimeApp {
 
         match save_result {
             Ok(()) => {
-                if self.settings.sync_leaderboard {
+                let mut message = if self.settings.sync_leaderboard {
                     if self.settings.leaderboard_username.trim().is_empty() {
-                        self.set_status(
-                            "Leaderboard sync enabled. Add a username to share your playtime.",
-                        );
+                        "Leaderboard sync enabled. Add a username to share your playtime."
+                            .to_string()
                     } else {
-                        self.set_status(format!(
+                        format!(
                             "Leaderboard sync enabled for {}.",
                             self.settings.leaderboard_username
-                        ));
+                        )
                     }
                 } else {
-                    self.set_status("Leaderboard sync disabled.");
+                    "Leaderboard sync disabled.".to_string()
+                };
+
+                if self.settings.sync_leaderboard {
+                    if let Some(LeaderboardClient::Remote {
+                        secondary: Some(_), ..
+                    }) = &self.leaderboard_client
+                    {
+                        message.push_str(
+                            " | Custom endpoint detected, mirroring submissions to the global leaderboard.",
+                        );
+                    } else {
+                        message.push_str(" | Syncing directly with the global leaderboard.");
+                    }
                 }
+
+                self.set_status(message);
             }
             Err(err) => {
                 self.set_status(format!("Failed to save leaderboard settings: {err}"));
@@ -1503,6 +1532,28 @@ impl PlaytimeApp {
             ui.label("Syncing leaderboard…");
         }
 
+        if self.settings.sync_leaderboard {
+            match &self.leaderboard_client {
+                Some(LeaderboardClient::Remote {
+                    secondary: Some(_), ..
+                }) => {
+                    ui.label(
+                        egui::RichText::new(
+                            "Submitting to custom endpoint and mirroring to the global leaderboard.",
+                        )
+                        .small(),
+                    );
+                }
+                Some(LeaderboardClient::Remote { .. }) => {
+                    ui.label(
+                        egui::RichText::new("Submitting directly to the global leaderboard.")
+                            .small(),
+                    );
+                }
+                _ => {}
+            }
+        }
+
         if self.leaderboard_entries.is_empty() {
             ui.label("No leaderboard data yet.");
         } else {
@@ -1804,7 +1855,11 @@ impl PlaytimeApp {
             }
 
             match &self.leaderboard_client {
-                Some(LeaderboardClient::Remote { endpoint, .. }) => {
+                Some(LeaderboardClient::Remote {
+                    endpoint,
+                    secondary,
+                    ..
+                }) => {
                     ui.label(
                         egui::RichText::new(format!(
                             "Active remote endpoint: {}",
@@ -1812,6 +1867,15 @@ impl PlaytimeApp {
                         ))
                         .small(),
                     );
+                    if let Some(secondary) = secondary {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Also mirroring to: {}",
+                                secondary.as_ref()
+                            ))
+                            .small(),
+                        );
+                    }
                 }
                 Some(LeaderboardClient::Local { .. }) => {
                     ui.label(egui::RichText::new("Using local leaderboard storage.").small());
